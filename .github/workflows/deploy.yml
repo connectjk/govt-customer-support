@@ -1,0 +1,98 @@
+name: Deploy to Azure Container Apps
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ACR_NAME: ${{ secrets.AZURE_ACR_NAME }}
+  RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+  CONTAINER_APP_NAME: govt-customer-support
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
+
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    needs: test
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login to ACR
+        run: az acr login --name $ACR_NAME
+
+      - name: Build & Push Docker Image
+        run: |
+          docker build -t $ACR_NAME.azurecr.io/$CONTAINER_APP_NAME:$IMAGE_TAG .
+          docker push $ACR_NAME.azurecr.io/$CONTAINER_APP_NAME:$IMAGE_TAG
+
+      - name: Deploy to Container Apps
+        run: |
+          if az containerapp show --name $CONTAINER_APP_NAME --resource-group $RESOURCE_GROUP > /dev/null 2>&1; then
+            echo "Updating existing container app..."
+            az containerapp registry set                       --name $CONTAINER_APP_NAME                       --resource-group $RESOURCE_GROUP                       --server $ACR_NAME.azurecr.io                       --identity system 2>/dev/null || true
+            az containerapp update                       --name $CONTAINER_APP_NAME                       --resource-group $RESOURCE_GROUP                       --image $ACR_NAME.azurecr.io/$CONTAINER_APP_NAME:$IMAGE_TAG
+          else
+            echo "Creating new container app..."
+            az containerapp create                       --name $CONTAINER_APP_NAME                       --resource-group $RESOURCE_GROUP                       --environment ${{ secrets.AZURE_CAE_NAME }}                       --image $ACR_NAME.azurecr.io/$CONTAINER_APP_NAME:$IMAGE_TAG                       --registry-server $ACR_NAME.azurecr.io                       --registry-identity system                       --target-port 8000                       --ingress external                       --cpu 0.5 --memory 1.0Gi                       --min-replicas 0 --max-replicas 3
+          fi
+
+      - name: Set Application Insights env var
+        run: |
+          az containerapp update                     --name $CONTAINER_APP_NAME                     --resource-group $RESOURCE_GROUP                     --set-env-vars "APPLICATIONINSIGHTS_CONNECTION_STRING=${{ secrets.APPLICATIONINSIGHTS_CONNECTION_STRING }}"
+
+      - name: Register Agent in AI Foundry
+        run: |
+          FQDN=$(az containerapp show --name $CONTAINER_APP_NAME --resource-group $RESOURCE_GROUP --query "properties.configuration.ingress.fqdn" -o tsv)
+          TOKEN=$(az account get-access-token --resource https://ai.azure.com --query accessToken -o tsv)
+          ENDPOINT="${{ secrets.AZURE_AI_FOUNDRY_ENDPOINT }}"
+
+          PAYLOAD=$(cat <<EOF
+          {
+            "name": "$CONTAINER_APP_NAME",
+            "description": "[Self-Hosted | Container Apps] Agent deployed at https://$FQDN",
+            "definition": {
+              "kind": "prompt",
+              "model": "gpt-4o",
+              "instructions": "Self-hosted agent running on Azure Container Apps at https://$FQDN"
+            }
+          }
+          EOF
+          )
+
+          HTTP_CODE=$(curl -s -o /tmp/foundry_resp.json -w "%{http_code}"                     -X POST "$ENDPOINT/agents?api-version=2025-05-15-preview"                     -H "Authorization: Bearer $TOKEN"                     -H "Content-Type: application/json"                     -d "$PAYLOAD")
+
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+            echo "Agent registered in AI Foundry successfully"
+          elif [ "$HTTP_CODE" = "409" ]; then
+            echo "Agent already registered in AI Foundry (409) - OK"
+          else
+            echo "Warning: Foundry registration returned $HTTP_CODE"
+            cat /tmp/foundry_resp.json
+          fi
