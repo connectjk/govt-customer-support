@@ -15,7 +15,10 @@ from opentelemetry import trace
 
 connection_string = os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING", "")
 if connection_string:
-    configure_azure_monitor(connection_string=connection_string)
+    configure_azure_monitor(
+        connection_string=connection_string,
+        enable_live_metrics=True,
+    )
     logging.info("Azure Monitor telemetry enabled")
 else:
     logging.warning("APPLICATIONINSIGHTS_CONNECTION_STRING not set - telemetry disabled")
@@ -61,17 +64,33 @@ async def health():
 @app.post("/invoke", response_model=InvokeResponse)
 async def invoke(req: InvokeRequest):
     """Invoke the agent with a message."""
-    with tracer.start_as_current_span("agent_invoke") as span:
-        span.set_attribute("agent.name", "govt-customer-support")
-        span.set_attribute("agent.session_id", req.session_id or "none")
-        span.set_attribute("agent.message_length", len(req.message))
+    with tracer.start_as_current_span(
+        "chat",
+        attributes={
+            "gen_ai.system": "az.ai.inference",
+            "gen_ai.operation.name": "chat",
+            "gen_ai.request.model": os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o"),
+            "gen_ai.agent.name": "govt-customer-support",
+            "gen_ai.agent.id": "govt-customer-support",
+            "agent.name": "govt-customer-support",
+            "agent.session_id": req.session_id or "none",
+            "agent.message_length": len(req.message),
+        }
+    ) as span:
+        # Log input as a gen_ai event
+        span.add_event("gen_ai.user.message", attributes={"gen_ai.event.content": req.message})
         try:
             result = await run_agent(req.message)
             span.set_attribute("agent.response_length", len(result))
             span.set_attribute("agent.status", "success")
+            span.set_attribute("gen_ai.response.model", os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o"))
+            span.set_attribute("gen_ai.usage.input_tokens", len(req.message) // 4)
+            span.set_attribute("gen_ai.usage.output_tokens", len(result) // 4)
+            # Log output as a gen_ai event
+            span.add_event("gen_ai.assistant.message", attributes={"gen_ai.event.content": result})
             return InvokeResponse(response=result, session_id=req.session_id)
         except Exception as e:
             span.set_attribute("agent.status", "error")
-            span.set_attribute("agent.error", str(e))
+            span.set_attribute("gen_ai.error", str(e))
             span.record_exception(e)
             raise HTTPException(status_code=500, detail=str(e))
